@@ -1,4 +1,7 @@
-import pywinusb.hid as hid
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hid_backend
 import time
 import math
 
@@ -6,7 +9,7 @@ VID = 0x3302
 PID = 0x43E8
 
 def continuous_pan(speed=0.5):
-    devices = hid.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
+    devices = hid_backend.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
     if not devices:
         print("DAC not found.")
         return

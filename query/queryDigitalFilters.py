@@ -1,4 +1,7 @@
-import pywinusb.hid as hid
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hid_backend
 import time
 
 # Device Config
@@ -17,7 +20,7 @@ class WalkplayReader:
             self.filter_val = data[4]
 
     def read_section_11(self):
-        devices = hid.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
+        devices = hid_backend.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
         if not devices:
             print("DAC not found.")
             return

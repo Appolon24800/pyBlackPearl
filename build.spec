@@ -1,8 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 
-block_cipher = None
-
-# These modules are massive and unused in your app. 
+# These modules are massive and unused in your app.
 # Keeping this list is critical to size reduction without UPX.
 excluded_modules = [
     'PySide6.QtWebEngine', 'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
@@ -22,13 +21,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=excluded_modules,
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
@@ -41,14 +37,12 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,              
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico'
+    icon='icon.ico' if sys.platform == 'win32' else None
 )

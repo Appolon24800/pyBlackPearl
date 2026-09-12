@@ -1,4 +1,5 @@
 --index-url https://pypi.org/simple/
 PySide6-Fluent-Widgets
-pywinusb
+pywinusb; sys_platform == "win32"
+hidapi; sys_platform == "darwin"
 pyinstaller

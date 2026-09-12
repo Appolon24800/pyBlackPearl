@@ -1,0 +1,6 @@
+# TRN Black Pearl / TTGK Technology TE-C USB DAC (VID 3302, PID 43E8)
+# Grants unprivileged users access to the DAC's HID interface.
+# Install with:
+#   sudo cp udev/99-trn-blackpearl.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3302", ATTRS{idProduct}=="43e8", MODE="0666"

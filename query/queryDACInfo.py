@@ -1,4 +1,7 @@
-import pywinusb.hid as hid
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hid_backend
 import time
 
 VID = 0x3302
@@ -13,7 +16,7 @@ def rx_handler(data):
         print(f"[Internal] Firmware Version : {version}")
 
 def get_complete_info():
-    filter = hid.HidDeviceFilter(vendor_id=VID, product_id=PID)
+    filter = hid_backend.HidDeviceFilter(vendor_id=VID, product_id=PID)
     devices = filter.get_devices()
 
     if not devices:

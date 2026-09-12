@@ -10,22 +10,23 @@ from threading import Thread, Lock
 from PySide6.QtGui import QIcon, QPainter, QColor, QPen, QBrush, QPainterPath, QPixmap
 
 
-import pywinusb.hid as hid
+import hid_backend
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize
 from PySide6.QtWidgets import QApplication, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QFileDialog, QInputDialog, QStackedWidget
 
 from qfluentwidgets import (
-    FluentWindow, SubtitleLabel, CaptionLabel, PushButton, PrimaryPushButton, 
-    ComboBox, Slider, LineEdit, CheckBox, CardWidget, InfoBar, 
-    StrongBodyLabel, setTheme, Theme, FluentIcon, BodyLabel, 
+    FluentWindow, SubtitleLabel, CaptionLabel, PushButton, PrimaryPushButton,
+    ComboBox, Slider, LineEdit, CheckBox, CardWidget, InfoBar,
+    StrongBodyLabel, setTheme, Theme, FluentIcon, BodyLabel,
     TransparentToolButton, SmoothScrollArea, SimpleCardWidget,
     NavigationItemPosition, isDarkTheme, qconfig, setThemeColor,
-    MessageBoxBase, MessageBox # Added MessageBoxBase
+    MessageBoxBase, MessageBox, SwitchButton
 )
 from qframelesswindow.utils import getSystemAccentColor
 
 os.environ["QT_API"] = "pyside6"
-os.environ["QSG_RHI_BACKEND"] = "vulkan"
+if sys.platform == "win32":
+    os.environ["QSG_RHI_BACKEND"] = "vulkan"
 
 def resource_path(relative_path):
     try:
@@ -50,7 +51,15 @@ FILTER_MAP = {0x01: "FAST-LL", 0x02: "Fast-PC (BEST)", 0x03: "Slow-LL", 0x04: "S
 GAIN_MAP = {0x00: "LOW", 0x01: "HIGH"}
 AMP_MAP = {0x00: "CLASS H", 0x01: "CLASS AB"}
 DEFAULT_FREQS = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 20000]
-VOL_MIN_RAW, VOL_MAX_RAW, UNITS_PER_DB = -9472, 6440, 256
+VOL_MIN_RAW, VOL_MAX_RAW, UNITS_PER_DB = -9472, 6400, 256
+VOL_QUANTUM = 256  # the DAC stores volume in whole dB steps
+
+def snap_volume(raw, floor_to_step=False):
+    """Snap to the DAC's 1 dB grid so written values read back unchanged.
+    The device rounds anything else (and clamps at 6400), which made the
+    volume slider snap back to 99% right after reaching 100%."""
+    steps = raw // VOL_QUANTUM if floor_to_step else math.floor(raw / VOL_QUANTUM + 0.5)
+    return max(VOL_MIN_RAW, min(VOL_MAX_RAW, steps * VOL_QUANTUM))
 
 # --- Math Helpers for the Graph ---
 def _calc_coeffs(t, f, q, g, fs=48000):
@@ -358,6 +367,7 @@ class EQGraph(QWidget):
 class Communicator(QObject):
     sync_finished = Signal(object, object, object)
     status_msg = Signal(str)
+    perm_msg = Signal(str)  # Persistent hint when the OS blocks device access
     hw_vol_changed = Signal(int)  # Emitted when physical DAC buttons are pressed
     
 class CustomInputDialog(MessageBoxBase):
@@ -405,6 +415,8 @@ class FluentDACController(FluentWindow):
         
         # Restore the dropped variables
         self.dirty_usb_tasks = set()
+        self._last_hid_error = ""
+        self.eq_bypass = bool(self.settings_data.get("eq_bypass", False))
         self.filter_desc_map = {
             "FAST-LL": "Fast roll-off, Low Latency. Best for gaming.",
             "Fast-PC (BEST)": "Fast roll-off, Phase Compensated. Recommended for general listening.",
@@ -550,7 +562,7 @@ class FluentDACController(FluentWindow):
 
     def load_settings(self):
         default_filters = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
-        default_data = {"balance": 0, "last_preset": 0, "presets": [{"name": "None", "preamp": 0.0, "filters": default_filters}]}
+        default_data = {"balance": 0, "last_preset": 0, "eq_bypass": False, "presets": [{"name": "None", "preamp": 0.0, "filters": default_filters}]}
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r") as f: 
@@ -751,6 +763,17 @@ class FluentDACController(FluentWindow):
         self.btn_delete.setToolTip("Delete Current Preset")
         self.btn_delete.clicked.connect(self._delete_preset)
         top_bar.addWidget(self.btn_delete)
+
+        # A/B switch: hardware EQ flat (bypassed) vs. the active preset.
+        # Band data is never touched - only what gets sent to the DAC.
+        self.eq_switch = SwitchButton(header_frame)
+        self.eq_switch.setOnText("EQ Active")
+        self.eq_switch.setOffText("Flat")
+        self.eq_switch.blockSignals(True)
+        self.eq_switch.setChecked(not self.eq_bypass)
+        self.eq_switch.blockSignals(False)
+        self.eq_switch.checkedChanged.connect(self._on_eq_bypass_toggle)
+        top_bar.addWidget(self.eq_switch)
 
         self.btn_reset = PushButton("Flat EQ", header_frame)
         self.btn_reset.clicked.connect(self._reset_eq)
@@ -1021,7 +1044,7 @@ class FluentDACController(FluentWindow):
         
         # Auto-level volume if EQ is modified and causes clipping
         if auto_level and self.last_raw_vol > safe_max:
-            self.last_raw_vol = safe_max
+            self.last_raw_vol = snap_volume(safe_max, floor_to_step=True)
             self._apply_filter(-1) # <-- FIX: Queue the new safe volume to physically send to the DAC!
             
         is_clipping = self.last_raw_vol > safe_max
@@ -1041,7 +1064,7 @@ class FluentDACController(FluentWindow):
         self.small_graph.update()
         
         # Sync Slider UI
-        pct = max(0, min(100, int(((self.last_raw_vol - VOL_MIN_RAW) / (VOL_MAX_RAW - VOL_MIN_RAW)) * 100)))
+        pct = max(0, min(100, round(((self.last_raw_vol - VOL_MIN_RAW) / (VOL_MAX_RAW - VOL_MIN_RAW)) * 100)))
         self._updating_ui = True
         self.vol_slider.setValue(pct); self.vol_txt.setText(f"{pct}%")
         self.eq_vol_slider.setValue(pct); self.eq_vol_txt.setText(f"{pct}%")
@@ -1051,7 +1074,7 @@ class FluentDACController(FluentWindow):
         if self._updating_ui or self.is_syncing: return
         
         # 1. Update the raw hardware math based on the slider position
-        self.last_raw_vol = int(VOL_MIN_RAW + (pos / 100.0) * (VOL_MAX_RAW - VOL_MIN_RAW))
+        self.last_raw_vol = snap_volume(int(VOL_MIN_RAW + (pos / 100.0) * (VOL_MAX_RAW - VOL_MIN_RAW)))
         
         # 2. Check headroom (This automatically syncs the sliders and text visually)
         self._check_headroom(auto_level=False)
@@ -1097,6 +1120,19 @@ class FluentDACController(FluentWindow):
             self.pre_slider.setValue(val)
         except ValueError:
             pass
+
+    def _on_eq_bypass_toggle(self):
+        """Flips the hardware EQ between flat and the active preset.
+        The preset itself is untouched - _process_usb_queue sends 0 dB for
+        every band while bypassed."""
+        if self._updating_ui: return
+        self.eq_bypass = not self.eq_switch.isChecked()
+        self.settings_data["eq_bypass"] = self.eq_bypass
+        self.save_settings()
+        for i in range(10):
+            self._apply_filter(i)
+        name = self.settings_data["presets"][self.preset_cb.currentIndex()]["name"]
+        InfoBar.info("EQ", f"Flat response (bypassed)" if self.eq_bypass else f"EQ active — {name}", duration=2000, parent=self)
 
     def _toggle_view(self):
         if self.stack.currentIndex() == 0:
@@ -1284,9 +1320,9 @@ class FluentDACController(FluentWindow):
             self.refresh()
 
     def toggle_controls(self, enabled):
-        objs = [self.vol_slider, self.eq_vol_slider, self.bal_slider, self.cb_filter, 
-                self.cb_gain, self.cb_amp, self.preset_cb, 
-                self.btn_reset, self.btn_add, self.btn_delete, 
+        objs = [self.vol_slider, self.eq_vol_slider, self.bal_slider, self.cb_filter,
+                self.cb_gain, self.cb_amp, self.preset_cb,
+                self.btn_reset, self.btn_add, self.btn_delete, self.eq_switch,
                 self.btn_import_meas, self.btn_import_target,
                 self.btn_import, self.btn_export, self.graph, self.small_graph,
                 self.btn_toggle_view, self.active_band_card,
@@ -1322,25 +1358,45 @@ class FluentDACController(FluentWindow):
         layout.addWidget(card)
         return cb, desc_lbl
 
+    def _open_device(self, dev):
+        """Opens the device and installs the data handler, reporting access errors."""
+        try:
+            dev.open()
+            dev.set_raw_data_handler(self.on_data)
+        except Exception as e:
+            self._report_hid_error(dev, e)
+            return False
+        return True
+
+    def _report_hid_error(self, dev, err):
+        msg = str(err) or type(err).__name__
+        key = msg[:120]
+        if self._last_hid_error == key: return
+        self._last_hid_error = key
+
+        if sys.platform.startswith("linux") and getattr(dev, "path", None) and not os.access(dev.path, os.R_OK | os.W_OK):
+            self.comm.perm_msg.emit(
+                f"No permission to open {dev.path}.\n\n"
+                "Install the bundled udev rule, then reconnect the DAC:\n"
+                "sudo cp udev/99-trn-blackpearl.rules /etc/udev/rules.d/\n"
+                "sudo udevadm control --reload && sudo udevadm trigger"
+            )
+        else:
+            print(f"HID open error: {msg}")
+
     def get_device(self):
-        # Keeps the device permanently open to prevent pywinusb queue crashes
+        # Keeps the device permanently open to prevent HID queue crashes
         if self.active_device and self.active_device.is_plugged():
             if not self.active_device.is_opened():
-                try: 
-                    self.active_device.open()
-                    self.active_device.set_raw_data_handler(self.on_data)
-                except: pass
-            return self.active_device
-            
-        devs = hid.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
-        if devs: 
+                self._open_device(self.active_device)
+            return self.active_device if self.active_device.is_opened() else None
+
+        devs = hid_backend.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
+        if devs:
             self.active_device = devs[0]
-            try:
-                self.active_device.open()
-                self.active_device.set_raw_data_handler(self.on_data)
-            except: pass
+            self._open_device(self.active_device)
         else: self.active_device = None
-        return self.active_device
+        return self.active_device if self.active_device and self.active_device.is_opened() else None
 
     def refresh(self):
         if self.is_syncing: return
@@ -1434,6 +1490,8 @@ class FluentDACController(FluentWindow):
     def _connect_logic(self):
         self.comm.sync_finished.connect(self.update_ui_state)
         self.comm.hw_vol_changed.connect(self._sync_hw_volume_ui)
+        self.comm.perm_msg.connect(lambda m: InfoBar.error(
+            "Device Access Denied", m, duration=-1, parent=self))
         self.comm.status_msg.connect(lambda m: [
             InfoBar.error("Status", m, duration=2000, parent=self),
             self.toggle_controls(False),
@@ -1476,27 +1534,30 @@ class FluentDACController(FluentWindow):
         self.desc_filter.setText(self.filter_desc_map.get(self.cb_filter.currentText(), ""))
             
         # 5. PEQ Identity Logic (Now runs on every sync/reconnect)
-        matched_idx = self._identify_preset(filters)
-        
-        if matched_idx != -1:
-            self.preset_cb.setCurrentIndex(matched_idx)
-        else:
-            none_idx = next((i for i, p in enumerate(self.settings_data["presets"]) if p["name"] == "None"), 0)
-            none_p = self.settings_data["presets"][none_idx]
-            
-            if CMD_GLOBAL_GAIN in results:
-                none_p["preamp"] = float(results[CMD_GLOBAL_GAIN])
-                
-            for i in range(10):
-                if i in filters:
-                    none_p["filters"][i].update({
-                        "freq": filters[i]["freq"],
-                        "gain": filters[i]["gain"],
-                        "q": filters[i]["q"],
-                        "type": filters[i]["type"],
-                        "enabled": (filters[i]["gain"] != 0.0)
-                    })
-            self.preset_cb.setCurrentIndex(none_idx)
+        # Skipped while the EQ is bypassed: the hardware reads flat and would
+        # hijack the preset selection back to "None"
+        if not self.eq_bypass:
+            matched_idx = self._identify_preset(filters)
+
+            if matched_idx != -1:
+                self.preset_cb.setCurrentIndex(matched_idx)
+            else:
+                none_idx = next((i for i, p in enumerate(self.settings_data["presets"]) if p["name"] == "None"), 0)
+                none_p = self.settings_data["presets"][none_idx]
+
+                if CMD_GLOBAL_GAIN in results:
+                    none_p["preamp"] = float(results[CMD_GLOBAL_GAIN])
+
+                for i in range(10):
+                    if i in filters:
+                        none_p["filters"][i].update({
+                            "freq": filters[i]["freq"],
+                            "gain": filters[i]["gain"],
+                            "q": filters[i]["q"],
+                            "type": filters[i]["type"],
+                            "enabled": (filters[i]["gain"] != 0.0)
+                        })
+                self.preset_cb.setCurrentIndex(none_idx)
 
         # 6. Finalize UI 
         self._updating_ui = False
@@ -1535,7 +1596,7 @@ class FluentDACController(FluentWindow):
                     if idx >= 0:
                         # Standard EQ Filter Logic
                         f_data = p["filters"][idx]
-                        g = 0.0 if not f_data.get("enabled", True) else float(f_data["gain"])
+                        g = 0.0 if (self.eq_bypass or not f_data.get("enabled", True)) else float(f_data["gain"])
                         f, q, t = max(1, int(f_data["freq"])), max(0.01, float(f_data["q"])), f_data["type"]
                         A, w0 = 10**(g/40), 2*math.pi*f/48000; sn, cs = math.sin(w0), math.cos(w0); alpha = sn/(2*q)
                         if t == "PK": b0, b1, b2, a0, a1, a2 = 1+alpha*A, -2*cs, 1-alpha*A, 1+alpha/A, -2*cs, 1-alpha/A
@@ -1682,7 +1743,9 @@ class FluentDACController(FluentWindow):
                 if "Filter" in line and idx < 10:
                     f_data = p["filters"][idx]
                     f_data["enabled"] = "ON" in line
-                    f_data["type"] = "PK" if " PK " in line else "LS" if " LS " in line else "HS"
+                    # AutoEq writes shelf filters as LSC/HSC; match without the
+                    # trailing space so they don't fall through to "HS"
+                    f_data["type"] = "PK" if " PK" in line else "LS" if " LS" in line else "HS"
                     fc, gn, qv = re.search(r"Fc\s+([\d.]+)", line), re.search(r"Gain\s+([-+.\d]+)", line), re.search(r"Q\s+([\d.]+)", line)
                     # Frequency: Clamp between 20Hz and 20,000Hz
                     if fc: f_data["freq"] = max(20, min(20000, float(fc.group(1))))

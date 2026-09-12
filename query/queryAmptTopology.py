@@ -1,4 +1,7 @@
-import pywinusb.hid as hid
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hid_backend
 import time
 
 VID = 0x3302
@@ -16,7 +19,7 @@ class AmpReader:
             self.state = data[4]
 
     def get_topology(self):
-        device = hid.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()[0]
+        device = hid_backend.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()[0]
         try:
             device.open()
             device.set_raw_data_handler(self.on_data)
